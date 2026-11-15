@@ -1533,7 +1533,28 @@ const FOLD_MAX_METERS = 15;
 // tips are placed from the band's shape, because the two legs' heat merges
 // there and shows no ridge.
 const CENTRE_STEP_METERS = 1.5;
-const CENTRE_TOLERANCE_METERS = 1.2;
+// Simplification tolerance of the centred line: low enough to keep the points
+// a curve needs to stay on the band's middle (more points on bends, few on
+// straights).
+const CENTRE_TOLERANCE_METERS = 0.3;
+// Tip rounding (see the end of centreOnBand): TIP_ROUND_PASSES passes of
+// neighbour averaging over TIP_ROUND_SAMPLES samples either side of each tip
+// spread the turn over several points; a point every TIP_KEEP_EVERY samples of
+// that stretch is kept.
+const TIP_ROUND_SAMPLES = 6;
+const TIP_ROUND_PASSES = 10;
+const TIP_KEEP_EVERY = 2;
+// River pass (see centreOnBand): each sample moves towards the middle of its
+// band, read between the half-peak edges straight across the line. The peak is
+// looked for within RIVER_PEAK_METERS, the edges within RIVER_REACH_METERS;
+// bands wider than RIVER_MAX_WIDTH_METERS (merged legs or ways) are left
+// alone. The moves are averaged over RIVER_SMOOTH_METERS along the line and
+// capped at RIVER_MAX_MOVE_METERS.
+const RIVER_PEAK_METERS = 1.5;
+const RIVER_REACH_METERS = 10;
+const RIVER_MAX_WIDTH_METERS = 14;
+const RIVER_SMOOTH_METERS = 6;
+const RIVER_MAX_MOVE_METERS = 2;
 const ROUTE_OFFSET_METERS = 0.5;
 const ROUTE_OFFSETS = 16;
 const ROUTE_MAX_CHANGE = 2;
@@ -1554,10 +1575,11 @@ const RIDGE_BASE_METERS = 3;
 const FOLD_SPAN_SAMPLES = 3;
 const FOLD_RESTORE_SAMPLES = 10;
 const BAND_RADIUS_METERS = 12;
-const TIP_MIN_TURN_DEGREES = 100;
+const TIP_MIN_TURN_DEGREES = 95;
 const TIP_NEAR_METERS = 8;
 const TIP_FAR_METERS = 20;
 const TIP_EDGE_METERS = 24;
+const TIP_EDGE_RISE = 0.03;
 
 // How far each pixel is inside its band: its distance, in pixels, to where the
 // heat falls below half of the local peak.
@@ -1636,7 +1658,7 @@ const THROUGH_BAND_FIT_METERS = 30;
 // A straight line accepts a node's new place only this close to its course.
 const COURSE_SIDEWAYS_METERS = 6;
 const OWN_STRETCH_METERS = 25;
-const JUNCTION_SNAP_METERS = 18;
+const JUNCTION_SNAP_METERS = 9;
 const JUNCTION_MAX_TURN_DEGREES = 45;
 // Least-squares y = a + b·x + c·x² through `points` ([x, y] pairs, at least 3).
 function fitParabola(points) {
@@ -1719,6 +1741,45 @@ function slideJunction(raster, loc, rays, course) {
     }
   }
   return best && unproject(best, raster.zoom);
+}
+
+// Whether a junction the other way passes through is on this line's own heat
+// band, so it stays where it is drawn. Across the line's
+// `course` at the node, up to BAND_RADIUS_METERS each side, climb the heat from
+// the node to its top (climbing, not taking the highest heat around, keeps to
+// the band the node is on, as climbBand). The band's ridge is where the heat is
+// at least ON_BAND_RIDGE_SHARE of that top, so a saturated, flat-topped band
+// counts whole. The node is on the band within ON_BAND_METERS of the ridge.
+// At a crossing the profile also runs along the other way, whose heat lifts
+// it everywhere: the test is the distance to the ridge, not the node's heat.
+// Without heat, nothing says it is on a band.
+const ON_BAND_METERS = 2.5;
+const ON_BAND_RIDGE_SHARE = 0.95;
+function onOwnBand(raster, loc, course) {
+  const scale = metersPerPixel(loc[1], raster.zoom),
+    start = project(loc, raster.zoom);
+  const length = Math.hypot(course[1][0] - course[0][0], course[1][1] - course[0][1]) || 1;
+  const nx = -(course[1][1] - course[0][1]) / length,
+    ny = (course[1][0] - course[0][0]) / length;
+  const step = 0.25 / scale,
+    reach = BAND_RADIUS_METERS / scale;
+  const heat = (o) => sampleDensity(raster, [start[0] + nx * o, start[1] + ny * o]);
+  let top = 0,
+    value = heat(0);
+  for (;;) {
+    const left = heat(top - step),
+      right = heat(top + step);
+    const next = left > right ? top - step : top + step,
+      v = Math.max(left, right);
+    if (v <= value || Math.abs(next) > reach) break;
+    top = next;
+    value = v;
+  }
+  if (value < MOVE_FIXED_MIN_HEAT) return false;
+  let ridge = 0;
+  while (Math.abs(ridge) < Math.abs(top) && heat(ridge) < ON_BAND_RIDGE_SHARE * value)
+    ridge += Math.sign(top) * step;
+  return Math.abs(ridge) * scale <= ON_BAND_METERS;
 }
 
 function hottestHeat(raster, loc) {
@@ -1927,11 +1988,17 @@ function centreOnBand(records, raster, fixed, otherWays, locations, free = new M
       [c[i + span][0] - c[i][0], c[i + span][1] - c[i][1]],
     ];
     const nearTurn = (i) => turnDegrees(...legs(i, near));
+    // A corner smoothing pinned as a hairpin is a tip here on the near test
+    // alone: a pinned corner left out of the tip step is never rounded.
+    const marked = run.flatMap((record, k) => (record.hairpin ? [sampleOf[k]] : []));
+    const isMarked = (i) => marked.some((m) => Math.abs(m - i) <= near);
     for (let i = near; i < c.length - near; i++) {
       const turn = nearTurn(i);
       if (turn < TIP_MIN_TURN_DEGREES) continue;
-      if (i < far || i >= c.length - far) continue;
-      if (turnDegrees(...legs(i, far)) < TIP_MIN_TURN_DEGREES) continue;
+      if (!isMarked(i)) {
+        if (i < far || i >= c.length - far) continue;
+        if (turnDegrees(...legs(i, far)) < TIP_MIN_TURN_DEGREES) continue;
+      }
       let peak = true;
       for (let j = Math.max(near, i - near); j <= Math.min(c.length - near - 1, i + near); j++)
         if (nearTurn(j) > turn) peak = false;
@@ -1944,9 +2011,21 @@ function centreOnBand(records, raster, fixed, otherWays, locations, free = new M
       const length = Math.hypot(ox, oy) || 1;
       ox /= length;
       oy /= length;
-      let edge = 0;
+      // The band's outer edge straight out from the tip; it ends at the first
+      // dip where the heat rises again (another trail's heat beyond the band's
+      // end, still above the band threshold), at the dip's bottom.
+      let edge = 0,
+        low = Infinity,
+        lowAt = 0;
       for (let d = 0; d <= TIP_EDGE_METERS / scale; d += 0.25) {
-        if (depthAt(c[i][0] + ox * d, c[i][1] + oy * d) <= 0.05) break;
+        const [x, y] = [c[i][0] + ox * d, c[i][1] + oy * d];
+        if (depthAt(x, y) <= 0.05) break;
+        const heat = sampleDensity(raster, [x, y]);
+        if (heat < low) [low, lowAt] = [heat, d];
+        else if (heat > low + TIP_EDGE_RISE) {
+          edge = lowAt;
+          break;
+        }
         edge = d;
       }
       const move = Math.max(0, edge - halfWidth);
@@ -2097,18 +2176,85 @@ function centreOnBand(records, raster, fixed, otherWays, locations, free = new M
     }
     c = c.map((p, i) => (restore.has(i) && i > 0 && i < c.length - 1 ? origin[i].slice() : p));
     // Round each tip over a few points: a single vertex turning back counts as
-    // a spike (see SPIKE_TURN_DEGREES in action.js).
+    // a spike (see SPIKE_TURN_DEGREES in action.js), and a tip that smoothing
+    // kept in place (see smoothLine) is otherwise one sharp corner.
     for (const tip of tips)
-      for (let pass = 0; pass < 2; pass++) {
+      for (let pass = 0; pass < TIP_ROUND_PASSES; pass++) {
         const next = c.map((p) => p.slice());
-        for (let j = Math.max(1, tip - 2); j <= Math.min(c.length - 2, tip + 2); j++)
+        const from = Math.max(1, tip - TIP_ROUND_SAMPLES),
+          to = Math.min(c.length - 2, tip + TIP_ROUND_SAMPLES);
+        for (let j = from; j <= to; j++)
           for (const axis of [0, 1])
             next[j][axis] = c[j][axis] / 2 + (c[j - 1][axis] + c[j + 1][axis]) / 4;
         c = next;
       }
+    // River pass: follow the middle of the heat band the way current follows a
+    // channel. At each sample, the band's middle is halfway between its two
+    // half-peak edges straight across the line (this works where the heat is
+    // saturated and flat-topped). Those offsets are averaged along the line over
+    // RIVER_SMOOTH_METERS so the line drifts with slow bends instead of stepping.
+    // Left alone: switchback tips (outer-edge rule above), the legs of a tip
+    // where their heat is merged (the river would pull them towards each
+    // other), fixed riders, the ends, and wherever the band is wider than
+    // RIVER_MAX_WIDTH_METERS or has no edge within reach.
+    const held = new Set();
+    for (const tip of tips) for (let k = -near * 3; k <= near * 3; k++) held.add(tip + k);
+    for (let i = 0; i < c.length; i++) if (merged[i]) held.add(i);
+    for (const sample of riders.keys())
+      for (let k = -2; k <= 2; k++) held.add(sample + k);
+    const normalAt = (i) => {
+      const dx = c[i + 1][0] - c[i - 1][0],
+        dy = c[i + 1][1] - c[i - 1][1],
+        dl = Math.hypot(dx, dy) || 1;
+      return [-dy / dl, dx / dl];
+    };
+    const reach = RIVER_REACH_METERS / scale,
+      dStep = 0.1 / scale;
+    const off = c.map(() => NaN);
+    for (let i = 2; i < c.length - 2; i++) {
+      if (held.has(i)) continue;
+      const [nx, ny] = normalAt(i);
+      const at = (o) => sampleDensity(raster, [c[i][0] + nx * o, c[i][1] + ny * o]);
+      let peak = 0;
+      for (let o = -RIVER_PEAK_METERS / scale; o <= RIVER_PEAK_METERS / scale; o += dStep)
+        peak = Math.max(peak, at(o));
+      if (peak < ROUTE_MIN_HEAT) continue;
+      let lo = 0,
+        hi = 0;
+      while (lo > -reach && at(lo - dStep) >= peak / 2) lo -= dStep;
+      while (hi < reach && at(hi + dStep) >= peak / 2) hi += dStep;
+      if (lo <= -reach || hi >= reach || (hi - lo) * scale > RIVER_MAX_WIDTH_METERS)
+        continue;
+      off[i] = (lo + hi) / 2;
+    }
+    const span = Math.max(1, Math.round(RIVER_SMOOTH_METERS / (step * scale)));
+    const limit = RIVER_MAX_MOVE_METERS / scale;
+    const flow = off.map((_, i) => {
+      let sum = 0,
+        weight = 0;
+      for (let k = -span; k <= span; k++) {
+        const v = off[i + k];
+        const w = 1 - Math.abs(k) / (span + 1);
+        weight += w;
+        if (Number.isFinite(v)) sum += v * w; // a missing reading pulls towards no move
+      }
+      // Fade out towards held samples (tips, riders, ends) so the shift leaves no kink.
+      let gap = Math.min(i, c.length - 1 - i);
+      for (const h of held) gap = Math.min(gap, Math.abs(h - i));
+      const fade = Math.min(1, gap / (2 * span + 1));
+      return Math.max(-limit, Math.min(limit, (sum / weight) * fade));
+    });
+    c = c.map((p, i) => {
+      if (i < 2 || i > c.length - 3 || held.has(i)) return p;
+      const [nx, ny] = normalAt(i);
+      return [p[0] + nx * flow[i], p[1] + ny * flow[i]];
+    });
     const keep = simplifyKeep(c, CENTRE_TOLERANCE_METERS / scale, raster);
     for (const tip of tips)
-      for (const j of [tip - 2, tip, tip + 2]) if (j > 0 && j < c.length - 1) keep[j] = 1;
+      for (let k = -TIP_ROUND_SAMPLES; k <= TIP_ROUND_SAMPLES; k += TIP_KEEP_EVERY) {
+        const j = tip + k;
+        if (j > 0 && j < c.length - 1) keep[j] = 1;
+      }
     for (const sample of riders.keys()) keep[sample] = 1;
     const kept = c.flatMap((_, i) => (keep[i] ? [i] : []));
     // Reuse the free original nodes, in order, for the nearest kept points. A
@@ -2446,13 +2592,18 @@ export async function slideLineTwice(locations, raster, options = {}) {
         else free.set(record.nodeIndex, target);
         continue;
       }
+      // A junction the other way passes through stays where it is drawn when
+      // it is on this line's band; off it, it slides along the other way.
+      const course = isJunction(original[k]) && courseAt(k);
       const moved = isJunction(original[k])
-        ? slideJunction(
-            raster,
-            record.loc,
-            alongOtherWay(original[k], otherWays, raster.zoom, reach),
-            courseAt(k)
-          )
+        ? onOwnBand(raster, record.loc, course)
+          ? null
+          : slideJunction(
+              raster,
+              record.loc,
+              alongOtherWay(original[k], otherWays, raster.zoom, reach),
+              course
+            )
         : climbBand(
             raster,
             record.loc,
@@ -2479,10 +2630,48 @@ export async function slideLineTwice(locations, raster, options = {}) {
 // (SMOOTH_TOLERANCE_METERS), so bends get many points and straight parts few;
 // original vertices of the stretch are reused, in order, for the nearest
 // points, so their OSM nodes are kept.
-const SMOOTH_STEP_METERS = 1.5;
+const SMOOTH_STEP_METERS = 0.75;
 const SMOOTH_PASSES = 24;
 const SMOOTH_TOLERANCE_METERS = 0.4;
 const SMOOTH_MIN_HEAT = 0.5;
+// Indices of the points of `points` (pixels) that are hairpin tips: the line
+// turns at least TIP_MIN_TURN_DEGREES between TIP_NEAR_METERS behind and ahead
+// of it, and more there than at any point within that distance.
+function hairpinTips(points, scale) {
+  const along = [0];
+  for (let k = 1; k < points.length; k++)
+    along.push(
+      along[k - 1] +
+        Math.hypot(points[k][0] - points[k - 1][0], points[k][1] - points[k - 1][1])
+    );
+  const reach = TIP_NEAR_METERS / scale;
+  const at = (distance) => {
+    if (distance <= 0) return points[0];
+    if (distance >= along[along.length - 1]) return points[points.length - 1];
+    let k = 1;
+    while (along[k] < distance) k++;
+    const t = (distance - along[k - 1]) / (along[k] - along[k - 1] || 1);
+    return [
+      points[k - 1][0] + (points[k][0] - points[k - 1][0]) * t,
+      points[k - 1][1] + (points[k][1] - points[k - 1][1]) * t,
+    ];
+  };
+  const turn = points.map((p, k) => {
+    if (along[k] < reach || along[k] > along[along.length - 1] - reach) return 0;
+    const a = at(along[k] - reach),
+      b = at(along[k] + reach);
+    return turnDegrees([p[0] - a[0], p[1] - a[1]], [b[0] - p[0], b[1] - p[1]]);
+  });
+  return turn.flatMap((t, k) =>
+    t >= TIP_MIN_TURN_DEGREES &&
+    turn.every(
+      (u, j) => Math.abs(along[j] - along[k]) > reach || u < t || (u === t && j >= k)
+    )
+      ? [k]
+      : []
+  );
+}
+
 function smoothLine(records, raster) {
   const zoom = raster.zoom;
   const scale = metersPerPixel(records[0].loc[1], zoom);
@@ -2490,12 +2679,35 @@ function smoothLine(records, raster) {
   const pinned = records.map(
     (record, k) => k === 0 || k === records.length - 1 || Boolean(record.drawn)
   );
+  // Hairpin tips stay where the trace put them: averaging pulls a tip far
+  // inside its turn (several metres on a switchback), more than centring can
+  // bring back where the two legs' heat merges. Smoothing runs up to each tip
+  // from both sides instead, so the legs still lose their hooks.
+  const points = records.map((record) => project(record.loc, zoom));
+  // A hairpin needs legs: a sharp turn within TIP_FAR_METERS of the line's end
+  // is a hook where the trace found the trail (often a fork), not a tip.
+  const along = [0];
+  for (let k = 1; k < points.length; k++)
+    along.push(
+      along[k - 1] +
+        Math.hypot(points[k][0] - points[k - 1][0], points[k][1] - points[k - 1][1]) *
+          scale
+    );
+  const fromEnds = along.map((a) => Math.min(a, along[along.length - 1] - a));
+  const hairpin = new Set(
+    hairpinTips(points, scale).filter((k) => fromEnds[k] >= TIP_FAR_METERS)
+  );
+  for (const k of hairpin) pinned[k] = true;
   const result = [records[0]];
   for (let from = 0; from < records.length - 1; ) {
     let to = from + 1;
     while (!pinned[to]) to++;
     const run = records.slice(from, to + 1);
-    result.push(...smoothRun(run, raster, step, scale).slice(1));
+    const smoothed = smoothRun(run, raster, step, scale).slice(1);
+    // Mark the pinned tip so centring rounds it too (it pins nothing there).
+    if (hairpin.has(to))
+      smoothed[smoothed.length - 1] = { ...smoothed[smoothed.length - 1], hairpin: true };
+    result.push(...smoothed);
     from = to;
   }
   return result;

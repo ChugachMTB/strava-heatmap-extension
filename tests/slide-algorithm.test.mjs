@@ -229,6 +229,98 @@ test('a path branching off a mapped road still slides from the junction', async 
   assert.ok(off < 3, `line runs ${off.toFixed(1)} m off the path`);
 });
 
+test('a junction is not dragged to another track crossing the line', async () => {
+  // The trail runs north along x = 0 and turns west at a junction (0, 0),
+  // where a mapped path ends, heading north. An unmapped track crosses the
+  // trail 11 m before the junction. The line is drawn 3 m east of the trail
+  // before the junction (way 76158507, node 81). Snapping the junction to the
+  // track's crossing (9.6 m away with an 18 m reach) folds the line back on
+  // itself. Crossings within JUNCTION_SNAP_METERS (9 m) still snap.
+  const trail = [],
+    side = [],
+    track = [];
+  for (let y = -150; y <= 0; y += 1) trail.push([0, y]);
+  for (let x = -1; x >= -150; x -= 1) trail.push([x, 0]);
+  for (let y = 1; y <= 80; y += 1) side.push([0, y]);
+  for (let x = -40; x <= 40; x += 1) track.push([x, -11]);
+  const raster = createHeatmapRaster(
+    trailTiles([
+      { centre: trail, peak: 0.3 },
+      { centre: side, peak: 0.3 },
+      { centre: track, peak: 0.3 },
+    ]),
+    15
+  );
+  const rough = [
+    [0, -150],
+    [3, -60],
+    [3, -20],
+    [3, -6],
+    [0, 0],
+    [-20, 0],
+    [-60, 0],
+    [-150, 0],
+  ];
+  const result = await slideLineTwice(rough.map(at), raster, {
+    fixedIndices: [0, 4, 7],
+    movableIndices: [4],
+    otherWays: [[at([0, 0]), at([0, 80])]],
+    yield: async () => {},
+  });
+  const junction = metres(result.find((point) => point.nodeIndex === 4).loc);
+  const moved = Math.hypot(...junction);
+  assert.ok(moved < 3, `junction moved ${moved.toFixed(1)} m`);
+});
+
+test('a crossing junction stays on its band and slides onto it from off it', async () => {
+  // The trail runs north along x = 0; a mapped path crosses it along y = 0 and
+  // passes through the line's junction node. On the band, the junction stays
+  // as drawn (Hunter Pass Bikers w1192973305 node 89). Drawn 7 m east of the
+  // band (Flattop Sunnyside w332538430 node 156), it slides along the path
+  // onto the band (to where the path meets the line's course, about 2 m from
+  // the band's middle here).
+  const trail = [],
+    path = [];
+  for (let y = -150; y <= 150; y += 1) trail.push([0, y]);
+  for (let x = -80; x <= 80; x += 1) path.push([x, 0]);
+  const raster = createHeatmapRaster(
+    trailTiles([
+      { centre: trail, peak: 1.3 },
+      { centre: path, peak: 0.8 },
+    ]),
+    15
+  );
+  const junctionAt = async (x) => {
+    const rough = [
+      [0, -150],
+      [x, -60],
+      [x, -20],
+      [x, 0],
+      [x, 20],
+      [x, 60],
+      [0, 150],
+    ];
+    const result = await slideLineTwice(rough.map(at), raster, {
+      fixedIndices: [0, 3, 6],
+      movableIndices: [3],
+      otherWays: [[at([-80, 0]), at(rough[3]), at([80, 0])]],
+      yield: async () => {},
+    });
+    return metres(result.find((point) => point.nodeIndex === 3).loc);
+  };
+  const on = await junctionAt(0.5);
+  assert.ok(
+    Math.hypot(on[0] - 0.5, on[1]) < 0.1,
+    `junction on the band moved to ${on.map((v) => v.toFixed(1))}`
+  );
+  const off = await junctionAt(7);
+  assert.ok(
+    Math.abs(off[0]) < 3,
+    `junction drawn off the band ends ${off[0].toFixed(1)} m from it`
+  );
+  assert.ok(Math.abs(off[1]) < 1, `junction left the path by ${off[1].toFixed(1)} m`);
+});
+
 test('a section never jumps to another heat trace', async () => {
   // A faint path along x = -10, and a stronger unmapped trace 10 m east of
   // its middle. The middle section must not detour onto it.
